@@ -150,6 +150,19 @@ class ReBotRSMITController:
         self.signal_count = 0
         self.last_error: Exception | None = None
 
+        # One feedback frame carries position, velocity and torque as well as temperature,
+        # so the sweep that reads temperatures is the whole telemetry: a separate 0x7019
+        # position read is another seven blocking round trips for something already on hand.
+        self.last_positions: list[float | None] = [
+            None for _ in self.config.motors
+        ]
+        self.last_velocities: list[float | None] = [
+            None for _ in self.config.motors
+        ]
+        self.last_torques: list[float | None] = [
+            None for _ in self.config.motors
+        ]
+
         self.last_temperatures: list[float | None] = [
             None for _ in self.config.motors
         ]
@@ -695,6 +708,9 @@ class ReBotRSMITController:
         请求新反馈并读取每个电机的 MOS 温度。"""
 
         temperatures: list[float | None] = []
+        positions: list[float | None] = []
+        velocities: list[float | None] = []
+        torques: list[float | None] = []
 
         # The lock is taken per motor, not across all seven. Held for the whole sweep it
         # starves the 200 Hz MIT sender for as long as the sweep takes: measured on a seven
@@ -719,6 +735,13 @@ class ReBotRSMITController:
                 except Exception:
                     state = None
 
+            positions.append(self._safe_float(getattr(state, "pos", None))
+                             if state is not None else None)
+            velocities.append(self._safe_float(getattr(state, "vel", None))
+                              if state is not None else None)
+            torques.append(self._safe_float(getattr(state, "torq", None))
+                           if state is not None else None)
+
             if state is None:
                 temperatures.append(None)
                 continue
@@ -729,6 +752,9 @@ class ReBotRSMITController:
                 )
             )
 
+        self.last_positions = positions
+        self.last_velocities = velocities
+        self.last_torques = torques
         self.last_temperatures = temperatures
         return temperatures
 
