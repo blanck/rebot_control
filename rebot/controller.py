@@ -113,6 +113,17 @@ class ReBotRSMITController:
             0.0 for _ in self.config.motors
         ]
 
+        # The velocity the caller's own trajectory is moving at, rad/s, repeated on every MIT
+        # frame until it is set again. Deriving it here from one ramp step instead reads zero
+        # whenever a step is starved, and kd turns that into a braking notch.
+        self.target_velocities = [
+            0.0 for _ in self.config.motors
+        ]
+
+        # A velocity with no fresh caller behind it is dropped: position is bounded by the
+        # ramp, but a velocity reference with no position error is a torque nobody asked for.
+        self.velocities_set_at = 0.0
+
         self.max_speeds_rad_s = [
             math.radians(20.0)
             for _ in self.config.motors
@@ -372,6 +383,11 @@ class ReBotRSMITController:
                 velocities = [0.0] * self.motor_count
 
                 with self.target_lock:
+                    fresh = (
+                        time.perf_counter() - self.velocities_set_at
+                        <= self.VELOCITY_HOLD_S
+                    )
+
                     for index in range(self.motor_count):
                         target = self.target_positions[index]
                         command = self.command_positions[index]
@@ -390,10 +406,15 @@ class ReBotRSMITController:
 
                         self.command_positions[index] += step
 
-                        # The speed this trajectory is actually moving at, rad/s, from the
-                        # step that was applied. Sent as zero, kd brakes every intended
-                        # move: the joint settles where kp * error = kd * velocity.
-                        velocities[index] = step / period
+                        # The caller's own trajectory velocity, held between its updates and
+                        # never faster than this joint may go. Sent as zero, kd brakes every
+                        # intended move: the joint settles where kp * error = kd * velocity.
+                        if fresh:
+                            limit = self.max_speeds_rad_s[index]
+                            velocities[index] = max(
+                                -limit,
+                                min(limit, self.target_velocities[index]),
+                            )
 
                     commands = self.command_positions.copy()
 
@@ -530,6 +551,7 @@ class ReBotRSMITController:
 
         with self.target_lock:
             self.target_positions[:] = positions
+            self.target_velocities[:] = [0.0] * self.motor_count
 
     def set_joint_angle(
         self,
@@ -556,6 +578,41 @@ class ReBotRSMITController:
             self.target_positions[joint_id - 1] = (
                 math.radians(value)
             )
+            self.target_velocities[joint_id - 1] = 0.0
+
+    VELOCITY_HOLD_S = 0.03
+
+    def set_joint_target(
+        self,
+        joint_id: int,
+        angle_deg: float,
+        velocity_rad_s: float,
+    ) -> None:
+        """Set one joint's target angle and the velocity its trajectory is moving at.
+        设置单个关节的目标角度及其轨迹速度。"""
+
+        if self.shutdown_started:
+            return
+
+        if not 1 <= joint_id <= self.motor_count:
+            raise ValueError(
+                f"joint_id must be 1-{self.motor_count}"
+                f" / joint_id 必须为 1-{self.motor_count}"
+            )
+
+        value = float(angle_deg)
+        speed = float(velocity_rad_s)
+
+        if not math.isfinite(value) or not math.isfinite(speed):
+            raise ValueError(
+                "Invalid angle_deg or velocity_rad_s"
+                " / angle_deg 或 velocity_rad_s 无效"
+            )
+
+        with self.target_lock:
+            self.target_positions[joint_id - 1] = math.radians(value)
+            self.target_velocities[joint_id - 1] = speed
+            self.velocities_set_at = time.perf_counter()
 
     def set_max_speeds(
         self,
@@ -1207,6 +1264,7 @@ class ReBotRSMITController:
             with self.target_lock:
                 self.command_positions[:] = commands
                 self.target_positions[:] = commands
+                self.target_velocities[:] = [0.0] * self.motor_count
 
             next_tick += period
             sleep_time = next_tick - time.perf_counter()
