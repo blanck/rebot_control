@@ -120,6 +120,8 @@ class ReBotRSMITController:
 
         # How often the MIT sender missed its frame, and by how much. Anything holding the
         # I/O lock (a seven motor position read is 56 ms of it) shows up here.
+        self.torque_cap_nm = self.TORQUE_CAP_NM
+
         self.late_frames = 0
         self.worst_late_s = 0.0
         self._last_frame_at = 0.0
@@ -153,6 +155,13 @@ class ReBotRSMITController:
         # One feedback frame carries position, velocity and torque as well as temperature,
         # so the sweep that reads temperatures is the whole telemetry: a separate 0x7019
         # position read is another seven blocking round trips for something already on hand.
+        # Feed-forward torque the caller wants added to each joint's MIT frame, N*m, held
+        # between its updates. Modelling gravity is the caller's job: this only carries it.
+        self.target_torques = [
+            0.0 for _ in self.config.motors
+        ]
+        self.torques_set_at = 0.0
+
         self.last_positions: list[float | None] = [
             None for _ in self.config.motors
         ]
@@ -389,7 +398,16 @@ class ReBotRSMITController:
 
         while not self.worker_stop_event.is_set():
             try:
+                torques = [0.0] * self.motor_count
+
                 with self.target_lock:
+                    # A torque with nobody refreshing it is dropped: unlike a position it is
+                    # not bounded by the ramp, so a caller that stops must not leave a push.
+                    fresh = (
+                        time.perf_counter() - self.torques_set_at
+                        <= self.TORQUE_HOLD_S
+                    )
+
                     for index in range(self.motor_count):
                         target = self.target_positions[index]
                         command = self.command_positions[index]
@@ -408,9 +426,15 @@ class ReBotRSMITController:
 
                         self.command_positions[index] += step
 
+                        if fresh:
+                            cap = abs(self.torque_cap_nm)
+                            torques[index] = max(
+                                -cap, min(cap, self.target_torques[index])
+                            )
+
                     commands = self.command_positions.copy()
 
-                self._send_mit_positions(commands)
+                self._send_mit_positions(commands, torques_nm=torques)
 
                 self._control_failures = 0
 
@@ -468,6 +492,7 @@ class ReBotRSMITController:
         self,
         positions_rad: Sequence[float],
         *,
+        torques_nm: Sequence[float] | None = None,
         lock_timeout: float | None = None,
     ) -> None:
         """Send a set of MIT position commands to all motors.
@@ -488,7 +513,8 @@ class ReBotRSMITController:
                         0.0,
                         float(motor_config.kp),
                         float(motor_config.kd),
-                        0.0,
+                        0.0 if torques_nm is None
+                        else float(torques_nm[index]),
                     )
                 except Exception as error:
                     failed.append((motor_config.motor_id, error))
@@ -549,6 +575,7 @@ class ReBotRSMITController:
 
         with self.target_lock:
             self.target_positions[:] = positions
+            self.target_torques[:] = [0.0] * self.motor_count
 
     def set_joint_angle(
         self,
@@ -575,6 +602,36 @@ class ReBotRSMITController:
             self.target_positions[joint_id - 1] = (
                 math.radians(value)
             )
+            self.target_torques[joint_id - 1] = 0.0
+
+    TORQUE_HOLD_S = 0.05
+    TORQUE_CAP_NM = 3.0
+
+    def set_joint_feedforward(
+        self,
+        joint_id: int,
+        torque_nm: float,
+    ) -> None:
+        """Add this feed-forward torque to the joint's MIT frames until it is set again.
+        为该关节的 MIT 指令添加前馈力矩，直到下次设置。"""
+
+        if self.shutdown_started:
+            return
+
+        if not 1 <= joint_id <= self.motor_count:
+            raise ValueError(
+                f"joint_id must be 1-{self.motor_count}"
+                f" / joint_id 必须为 1-{self.motor_count}"
+            )
+
+        value = float(torque_nm)
+
+        if not math.isfinite(value):
+            raise ValueError("Invalid torque_nm / torque_nm 无效")
+
+        with self.target_lock:
+            self.target_torques[joint_id - 1] = value
+            self.torques_set_at = time.perf_counter()
 
     def set_max_speeds(
         self,
@@ -1244,6 +1301,7 @@ class ReBotRSMITController:
             with self.target_lock:
                 self.command_positions[:] = commands
                 self.target_positions[:] = commands
+                self.target_torques[:] = [0.0] * self.motor_count
 
             next_tick += period
             sleep_time = next_tick - time.perf_counter()
