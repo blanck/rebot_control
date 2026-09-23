@@ -287,6 +287,10 @@ class ReBotRSMITController:
         self.shutdown_started = False
         self.signal_count = 0
         self.last_error = None
+        # Consecutive control-loop failures tolerated before the arm is disabled. A
+        # single dropped frame is not a dead bus, and at 200 Hz ten of them is 50 ms.
+        self.max_control_failures = 10
+        self._control_failures = 0
         self._temp_alarm_active = [
             False for _ in self.config.motors
         ]
@@ -388,12 +392,28 @@ class ReBotRSMITController:
 
                 self._send_mit_positions(commands)
 
+                self._control_failures = 0
+
             except Exception as error:
                 self.last_error = error
+                self._control_failures += 1
 
                 print(
                     f"\n[Control error / 控制错误] {error}"
+                    f" ({self._control_failures}/{self.max_control_failures})"
                 )
+
+                # One dropped frame is not a dead bus. Disabling on the first
+                # exception drops a loaded arm for a transient, and at 200 Hz a
+                # single miss out of two hundred a second was enough.
+                if self._control_failures < self.max_control_failures:
+                    next_tick += period
+                    sleep_time = next_tick - time.perf_counter()
+                    if sleep_time > 0:
+                        time.sleep(sleep_time)
+                    else:
+                        next_tick = time.perf_counter()
+                    continue
 
                 # Do not attempt return-to-zero on a communication failure.
                 # 通信异常时不再尝试回零。
@@ -425,17 +445,31 @@ class ReBotRSMITController:
         """Send a set of MIT position commands to all motors.
         向全部电机发送一组 MIT 位置指令。"""
 
+        failed = []
+
         with self._io_lock_guard(lock_timeout):
             for index, motor in enumerate(self.motors):
                 motor_config = self.config.motors[index]
 
-                motor.send_mit(
-                    float(positions_rad[index]),
-                    0.0,
-                    float(motor_config.kp),
-                    float(motor_config.kd),
-                    0.0,
-                )
+                # A raise here is the CAN socket, not the motor: send_mit is
+                # unacknowledged, so a dead motor is silent. Kept per motor only so a
+                # transient socket error on one does not skip the rest of the frame.
+                try:
+                    motor.send_mit(
+                        float(positions_rad[index]),
+                        0.0,
+                        float(motor_config.kp),
+                        float(motor_config.kd),
+                        0.0,
+                    )
+                except Exception as error:
+                    failed.append((motor_config.motor_id, error))
+
+        if failed:
+            raise RuntimeError(
+                "motors %s did not take a command: %s"
+                % ([m for m, _ in failed], failed[0][1])
+            )
 
     # -------------------------------------------------------------------------
     # External control interface / 外部控制接口
