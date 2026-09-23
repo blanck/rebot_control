@@ -118,6 +118,13 @@ class ReBotRSMITController:
             for _ in self.config.motors
         ]
 
+        # How often the MIT sender missed its frame, and by how much. Anything holding the
+        # I/O lock (a seven motor position read is 56 ms of it) shows up here.
+        self.late_frames = 0
+        self.worst_late_s = 0.0
+        self._last_frame_at = 0.0
+        self.LATE_FRAME_S = 0.005
+
         self.target_lock = threading.RLock()
         self.io_lock = threading.RLock()
         self.shutdown_lock = threading.Lock()
@@ -427,6 +434,14 @@ class ReBotRSMITController:
                     wait=False,
                 )
                 return
+
+            now = time.perf_counter()
+            if self._last_frame_at:
+                late = now - self._last_frame_at - period
+                if late > self.LATE_FRAME_S:
+                    self.late_frames += 1
+                    self.worst_late_s = max(self.worst_late_s, late)
+            self._last_frame_at = now
 
             next_tick += period
             sleep_time = next_tick - time.perf_counter()
