@@ -369,6 +369,8 @@ class ReBotRSMITController:
 
         while not self.worker_stop_event.is_set():
             try:
+                velocities = [0.0] * self.motor_count
+
                 with self.target_lock:
                     for index in range(self.motor_count):
                         target = self.target_positions[index]
@@ -388,9 +390,14 @@ class ReBotRSMITController:
 
                         self.command_positions[index] += step
 
+                        # The speed this trajectory is actually moving at, rad/s, from the
+                        # step that was applied. Sent as zero, kd brakes every intended
+                        # move: the joint settles where kp * error = kd * velocity.
+                        velocities[index] = step / period
+
                     commands = self.command_positions.copy()
 
-                self._send_mit_positions(commands)
+                self._send_mit_positions(commands, velocities_rad_s=velocities)
 
                 self._control_failures = 0
 
@@ -440,6 +447,7 @@ class ReBotRSMITController:
         self,
         positions_rad: Sequence[float],
         *,
+        velocities_rad_s: Sequence[float] | None = None,
         lock_timeout: float | None = None,
     ) -> None:
         """Send a set of MIT position commands to all motors.
@@ -457,7 +465,8 @@ class ReBotRSMITController:
                 try:
                     motor.send_mit(
                         float(positions_rad[index]),
-                        0.0,
+                        0.0 if velocities_rad_s is None
+                        else float(velocities_rad_s[index]),
                         float(motor_config.kp),
                         float(motor_config.kd),
                         0.0,
