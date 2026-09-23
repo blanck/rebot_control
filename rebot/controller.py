@@ -650,15 +650,15 @@ class ReBotRSMITController:
 
         positions = []
 
-        with self._io_lock_guard():
-            for index, motor in enumerate(self.motors):
+        # Per motor, for the same reason as the temperature sweep: seven blocking round
+        # trips, and the 200 Hz MIT sender needs the same lock to reach the bus at all.
+        for index, motor in enumerate(self.motors):
+            with self._io_lock_guard():
                 try:
                     position = motor.robstride_get_param_f32(
                         0x7019,
                         timeout_ms=500,
                     )
-
-                    positions.append(float(position))
 
                 except Exception as error:
                     motor_id = (
@@ -671,6 +671,8 @@ class ReBotRSMITController:
                         f" / 电机 {motor_id} 位置读取失败："
                         f"{error}"
                     ) from error
+
+            positions.append(float(position))
 
         return positions
 
@@ -694,10 +696,13 @@ class ReBotRSMITController:
 
         temperatures: list[float | None] = []
 
-        with self._io_lock_guard():
-            for motor in self.motors:
-                state = None
+        # The lock is taken per motor, not across all seven. Held for the whole sweep it
+        # starves the 200 Hz MIT sender for as long as the sweep takes: measured on a seven
+        # motor arm, 3.7 late frames a second and 74 ms at worst, felt as a stutter.
+        for motor in self.motors:
+            state = None
 
+            with self._io_lock_guard():
                 try:
                     motor.request_feedback()
                 except Exception:
@@ -714,15 +719,15 @@ class ReBotRSMITController:
                 except Exception:
                     state = None
 
-                if state is None:
-                    temperatures.append(None)
-                    continue
+            if state is None:
+                temperatures.append(None)
+                continue
 
-                temperatures.append(
-                    self._safe_float(
-                        getattr(state, "t_mos", None)
-                    )
+            temperatures.append(
+                self._safe_float(
+                    getattr(state, "t_mos", None)
                 )
+            )
 
         self.last_temperatures = temperatures
         return temperatures
